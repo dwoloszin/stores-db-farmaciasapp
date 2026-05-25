@@ -329,9 +329,7 @@ def scrape(db, limit: Optional[int] = None) -> Dict:
     import gc
 
     session   = _make_session()
-    seen_skus: set = db.load_existing_product_ids()
-    if seen_skus:
-        print(f"Resuming: {len(seen_skus):,} products already in DB — completed categories will be skipped.")
+    seen_skus: set = set()
     total_saved = total_upserted = total_history = total_skipped = 0
 
     print("Fetching category tree from /categorias ...")

@@ -209,9 +209,7 @@ def _fetch_page(session: requests.Session, from_idx: int, to_idx: int) -> List[D
 
 
 def scrape(db, limit: Optional[int] = None) -> Dict[str, int]:
-    seen_ids = db.load_existing_product_ids()
-    if seen_ids:
-        print(f"Resuming: {len(seen_ids):,} products already in DB - will be skipped.")
+    seen_ids: set = set()
 
     session = _make_session()
 

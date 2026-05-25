@@ -51,3 +51,7 @@ drogasil_*.csv
 
 # Local caches
 *.jsonl
+
+
+# local file
+README_LOCAL.md

@@ -39,7 +39,8 @@
       "Bash(gh auth *)",
       "Bash(python deploy/deploy.py --dry-run)",
       "Bash(python deploy/deploy.py)",
-      "Bash(python deploy/deploy.py --force)"
+      "Bash(python deploy/deploy.py --force)",
+      "Bash(python -m main --limit 100 --log)"
     ],
     "additionalDirectories": [
       "c:\\Users\\dwolo\\.claude\\projects\\c--Users-dwolo-Documents-DARIO-PYTHON-markets-db-farm\\memory"

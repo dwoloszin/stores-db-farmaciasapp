@@ -257,10 +257,19 @@ class StoreDB:
 
     def _load_existing_prices(
         self,
+        product_ids: Optional[List[str]] = None,
     ) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
-        """Returns {product_id: (regular_price, promo_price)} from current offers."""
+        """Returns {product_id: (regular_price, promo_price)} scoped to the given ids.
+        Passing product_ids keeps the query small (batch-sized) instead of full-table."""
         with self._conn.cursor() as cur:
-            cur.execute("SELECT product_id, regular_price, promo_price FROM offers")
+            if product_ids:
+                cur.execute(
+                    "SELECT product_id, regular_price, promo_price FROM offers"
+                    " WHERE product_id = ANY(%s)",
+                    (product_ids,),
+                )
+            else:
+                cur.execute("SELECT product_id, regular_price, promo_price FROM offers")
             return {
                 row[0]: (_to_float(row[1]), _to_float(row[2]))
                 for row in cur.fetchall()
@@ -306,7 +315,8 @@ class StoreDB:
         if verbose:
             print(f"  Offers: {len(valid):,} valid, {skipped_zero:,} skipped (zero/null price)")
 
-        existing = self._load_existing_prices()
+        batch_pids = [str(o.get("product_id", "")).strip() for o in valid]
+        existing = self._load_existing_prices(batch_pids)
         if verbose:
             print(f"  Existing rows in offers table: {len(existing):,}")
 

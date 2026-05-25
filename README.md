@@ -102,10 +102,16 @@ python -m main --enrich-only
 
 
 # Neon Account woloszin
-https://console.neon.tech/app/org-frosty-thunder-42990735/projects
+
 
 # run main and anrrich
 python -m main --enrich-ean
+
+
+
+
+# Deploy To update code in all repos after changes — run python deploy/deploy.py --force from the master repo.
+python deploy/deploy.py --force
 
 
 

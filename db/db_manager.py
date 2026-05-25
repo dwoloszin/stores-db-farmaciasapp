@@ -87,6 +87,33 @@ CREATE TABLE IF NOT EXISTS price_history (
 
 CREATE INDEX IF NOT EXISTS idx_ph_product  ON price_history(product_id);
 CREATE INDEX IF NOT EXISTS idx_ph_recorded ON price_history(recorded_at DESC);
+
+CREATE OR REPLACE FUNCTION trg_price_history()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF (TG_OP = 'INSERT') OR (
+        TG_OP = 'UPDATE' AND (
+            NEW.regular_price IS DISTINCT FROM OLD.regular_price OR
+            NEW.promo_price   IS DISTINCT FROM OLD.promo_price
+        )
+    ) THEN
+        INSERT INTO price_history (
+            product_id, store_id, product_name, ean,
+            regular_price, promo_price, discount_pct,
+            is_available, offer_tag, is_discounted, recorded_at
+        ) VALUES (
+            NEW.product_id, NEW.store_id, NEW.product_name, NEW.ean,
+            NEW.regular_price, NEW.promo_price, NEW.discount_pct,
+            NEW.is_available, NEW.offer_tag, NEW.is_discounted, NOW()
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER price_history_trigger
+AFTER INSERT OR UPDATE ON offers
+FOR EACH ROW EXECUTE FUNCTION trg_price_history();
 """
 
 # Columns added in the unified schema that older per-store tables won't have.
@@ -134,16 +161,6 @@ def _to_int(v: Any) -> Optional[int]:
     except (ValueError, TypeError):
         return None
 
-
-def _prices_changed(
-    old_regular: Optional[float],
-    old_promo:   Optional[float],
-    new_regular: Optional[float],
-    new_promo:   Optional[float],
-) -> bool:
-    def _r(x):
-        return round(x, 2) if x is not None else None
-    return _r(old_regular) != _r(new_regular) or _r(old_promo) != _r(new_promo)
 
 
 def load_env(path: str = ".env") -> None:
@@ -255,28 +272,6 @@ class StoreDB:
 
     # ------------------------------------------------------------------
 
-    def _load_existing_prices(
-        self,
-        product_ids: Optional[List[str]] = None,
-    ) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
-        """Returns {product_id: (regular_price, promo_price)} scoped to the given ids.
-        Passing product_ids keeps the query small (batch-sized) instead of full-table."""
-        with self._conn.cursor() as cur:
-            if product_ids:
-                cur.execute(
-                    "SELECT product_id, regular_price, promo_price FROM offers"
-                    " WHERE product_id = ANY(%s)",
-                    (product_ids,),
-                )
-            else:
-                cur.execute("SELECT product_id, regular_price, promo_price FROM offers")
-            return {
-                row[0]: (_to_float(row[1]), _to_float(row[2]))
-                for row in cur.fetchall()
-            }
-
-    # ------------------------------------------------------------------
-
     def save(self, offers: List[Dict], batch_size: int = 200, verbose: bool = True) -> Dict[str, int]:
         """
         Upsert offers and append price_history rows for changed prices.
@@ -296,85 +291,44 @@ class StoreDB:
         store_id = self.STORE_ID
 
         # Normalize single-price scrapers: map 'price' -> 'regular_price'
-        normalized: List[Dict] = []
+        rows: List[tuple] = []
+        skipped_zero = 0
         for o in offers:
             if "price" in o and "regular_price" not in o:
                 o = {**o, "regular_price": o["price"]}
-            normalized.append(o)
-
-        # Filter out zero / null regular_price
-        valid: List[Dict] = []
-        skipped_zero = 0
-        for o in normalized:
             rp = _to_float(o.get("regular_price"))
             if rp is None or rp <= 0:
                 skipped_zero += 1
                 continue
-            valid.append(o)
-
-        if verbose:
-            print(f"  Offers: {len(valid):,} valid, {skipped_zero:,} skipped (zero/null price)")
-
-        batch_pids = [str(o.get("product_id", "")).strip() for o in valid]
-        existing = self._load_existing_prices(batch_pids)
-        if verbose:
-            print(f"  Existing rows in offers table: {len(existing):,}")
-
-        upsert_rows:  List[tuple] = []
-        history_rows: List[tuple] = []
-
-        for o in valid:
-            pid     = str(o.get("product_id", "")).strip()
-            regular = _to_float(o.get("regular_price"))
-            promo   = _to_float(o.get("promo_price"))
-            disc    = _to_float(o.get("discount_pct"))
-            avail   = _to_bool(o.get("is_available"))
-            stock   = _to_int(o.get("stock"))
-            is_disc = _to_bool(o.get("is_discounted"))
-            is_gen  = _to_bool(o.get("is_generic"))
-            prescr  = _to_bool(o.get("prescription"))
-            scraped = o.get("scraped_at") or now.isoformat()
-
-            upsert_rows.append((
-                pid,
+            rows.append((
+                str(o.get("product_id",    "")).strip(),
                 store_id,
-                str(o.get("product_name",   "")).strip(),
-                str(o.get("brand",          "") or "").strip() or None,
-                str(o.get("category_path",  "") or "").strip() or None,
-                str(o.get("ean",            "") or "").strip() or None,
-                regular,
-                promo,
-                disc,
-                str(o.get("unit",           "") or "").strip() or None,
-                avail,
-                stock,
-                str(o.get("offer_tag",      "") or "").strip() or None,
-                is_disc,
-                is_gen,
-                prescr,
-                str(o.get("product_url",    "") or "").strip() or None,
-                str(o.get("image_url",      "") or "").strip() or None,
-                scraped,
+                str(o.get("product_name",  "")).strip(),
+                str(o.get("brand",         "") or "").strip() or None,
+                str(o.get("category_path", "") or "").strip() or None,
+                str(o.get("ean",           "") or "").strip() or None,
+                rp,
+                _to_float(o.get("promo_price")),
+                _to_float(o.get("discount_pct")),
+                str(o.get("unit",          "") or "").strip() or None,
+                _to_bool(o.get("is_available")),
+                _to_int(o.get("stock")),
+                str(o.get("offer_tag",     "") or "").strip() or None,
+                _to_bool(o.get("is_discounted")),
+                _to_bool(o.get("is_generic")),
+                _to_bool(o.get("prescription")),
+                str(o.get("product_url",   "") or "").strip() or None,
+                str(o.get("image_url",     "") or "").strip() or None,
+                o.get("scraped_at") or now.isoformat(),
                 now,
             ))
 
-            old = existing.get(pid)
-            if old is None or _prices_changed(old[0], old[1], regular, promo):
-                history_rows.append((
-                    pid,
-                    store_id,
-                    str(o.get("product_name", "")).strip(),
-                    str(o.get("ean",          "") or "").strip() or None,
-                    regular,
-                    promo,
-                    disc,
-                    avail,
-                    str(o.get("offer_tag",    "") or "").strip() or None,
-                    is_disc,
-                    now,
-                ))
+        if verbose:
+            print(f"  Offers: {len(rows):,} valid, {skipped_zero:,} skipped (zero/null price)")
 
-        # Batch upsert offers
+        # Pure upsert — no prior SELECT needed.
+        # price_history rows are written automatically by the DB trigger
+        # (trg_price_history) on INSERT and on price-changing UPDATEs.
         upsert_sql = """
             INSERT INTO offers (
                 product_id, store_id, product_name, brand, category_path, ean,
@@ -405,37 +359,14 @@ class StoreDB:
         """
 
         with self._conn.cursor() as cur:
-            for i in range(0, len(upsert_rows), batch_size):
-                batch = upsert_rows[i : i + batch_size]
-                psycopg2.extras.execute_values(cur, upsert_sql, batch)
-                if verbose:
-                    print(f"  Upserted offers batch {i // batch_size + 1}: {len(batch)} rows")
-
-        # Batch insert price_history
-        history_sql = """
-            INSERT INTO price_history (
-                product_id, store_id, product_name, ean,
-                regular_price, promo_price, discount_pct,
-                is_available, offer_tag, is_discounted, recorded_at
-            ) VALUES %s
-        """
-
-        if history_rows:
-            with self._conn.cursor() as cur:
-                for i in range(0, len(history_rows), batch_size):
-                    batch = history_rows[i : i + batch_size]
-                    psycopg2.extras.execute_values(cur, history_sql, batch)
-            if verbose:
-                print(f"  Inserted {len(history_rows):,} price_history rows.")
-        else:
-            if verbose:
-                print("  No price changes — price_history unchanged.")
+            for i in range(0, len(rows), batch_size):
+                psycopg2.extras.execute_values(cur, upsert_sql, rows[i : i + batch_size])
 
         self._conn.commit()
 
         return {
-            "upserted":         len(upsert_rows),
-            "history_inserted": len(history_rows),
+            "upserted":         len(rows),
+            "history_inserted": 0,
             "skipped_zero":     skipped_zero,
         }
 

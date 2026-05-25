@@ -1,0 +1,47 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.drogaleste.com.br)",
+      "Bash(python markets/drogaleste/scraper_drogaleste.py --limit 50 --output drogaleste_test.csv)",
+      "Bash(python markets/drogaleste/scraper_drogaleste.py --limit 100 --output drogaleste_test.csv)",
+      "Bash(Get-Process python*)",
+      "Bash(Select-Object Name, Id, CPU)",
+      "Bash(python -u markets/drogaleste/scraper_drogaleste.py --limit 100 --output drogaleste_test.csv)",
+      "Bash(python -u -c ' *)",
+      "Bash(python -u markets/drogaleste/scraper_drogaleste.py)",
+      "Bash(python -c \"import psycopg2; print\\('psycopg2:', psycopg2.__version__\\)\")",
+      "Bash(python -c \"import psycopg; print\\('psycopg3:', psycopg.__version__\\)\")",
+      "Bash(python -u markets/drogaleste/db_drogaleste.py drogaleste_20260519_1400.csv)",
+      "WebFetch(domain:www.drogasil.com.br)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -A \"Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/124.0.0.0 Safari/537.36\" -H \"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\" -H \"Accept-Language: pt-BR,pt;q=0.9\" -H \"Accept-Encoding: gzip, deflate, br\" --compressed \"https://www.drogasil.com.br/\")",
+      "Bash(python -c ' *)",
+      "Bash(python -u markets/drogasil/scraper_drogasil.py --limit 150 --output drogasil_test.csv)",
+      "Bash(python -u markets/drogasil/scraper_drogasil.py)",
+      "Bash(python -)",
+      "Bash(New-Item -ItemType Directory -Force \"c:\\\\Users\\\\dwolo\\\\Documents\\\\DARIO\\\\PYTHON\\\\markets_db_farm\\\\markets\\\\drogariasaopaulo\")",
+      "Bash(Out-Null)",
+      "PowerShell(New-Item -ItemType Directory -Force \"c:\\\\Users\\\\dwolo\\\\Documents\\\\DARIO\\\\PYTHON\\\\markets_db_farm\\\\markets\\\\drogariasaopaulo\")",
+      "PowerShell(\"done\")",
+      "Bash(python -c \"import main; print\\('OK'\\)\")",
+      "WebFetch(domain:www.ultrafarma.com.br)",
+      "Read(//c/Users/dwolo/.claude/projects/c--Users-dwolo-Documents-DARIO-PYTHON-markets-db-farm/memory/**)",
+      "WebFetch(domain:www.paguemenos.com.br)",
+      "Bash(python -c \"import markets.farmais.scraper_farmais as f; print\\('Import OK'\\)\")",
+      "Bash(python -c \"import markets.panvel.scraper_panvel as p; print\\('Import OK'\\)\")",
+      "Bash(python)",
+      "Bash(python -m main --help)",
+      "WebFetch(domain:www.farmaciasapp.com.br)",
+      "WebSearch",
+      "WebFetch(domain:developers.farmaciasapp.com.br)",
+      "WebFetch(domain:help.vtex.com)",
+      "Bash(git ls-files *)",
+      "Bash(gh secret *)",
+      "Bash(gh auth *)",
+      "Bash(python deploy/deploy.py --dry-run)",
+      "Bash(python deploy/deploy.py)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\dwolo\\.claude\\projects\\c--Users-dwolo-Documents-DARIO-PYTHON-markets-db-farm\\memory"
+    ]
+  }
+}

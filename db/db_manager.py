@@ -1,0 +1,805 @@
+"""
+db_manager.py — Centralized PostgreSQL persistence for all store scrapers.
+
+Each store has its own DATABASE_URL (separate Postgres instance). This module
+provides a single StoreDB base class and one small subclass per store.
+
+Two tables per database:
+  offers        — current state, always upserted with the latest valid price.
+                  Zero / null regular_price rows are skipped.
+  price_history — append-only change log; new row only when price changes.
+                  Identical consecutive scrapes produce no new rows.
+
+Offer normalization:
+  Scrapers that produce a single "price" field (e.g. Drogasil) have it
+  automatically mapped to "regular_price" so save() handles both layouts.
+
+Schema migration:
+  _ensure_tables() runs ALTER TABLE ADD COLUMN IF NOT EXISTS to upgrade
+  existing databases that were created with the older per-store DDL.
+
+Usage (imported):
+    from db.db_manager import DrogalesteDB, DrogasilDB
+    db = DrogasilDB()
+    db.save(offers)
+    db.close()
+
+CLI:
+    python -m db.db_manager drogaleste drogaleste_20260519.csv
+    python -m db.db_manager drogasil   drogasil_20260519.csv
+    python -m db.db_manager drogasil   drogasil_20260519.csv --env .env
+"""
+
+import csv
+import os
+import sys
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import psycopg2
+import psycopg2.extras
+
+sys.stdout.reconfigure(line_buffering=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Unified DDL
+# ──────────────────────────────────────────────────────────────────────────────
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS offers (
+    product_id      TEXT PRIMARY KEY,
+    store_id        TEXT NOT NULL DEFAULT '',
+    product_name    TEXT NOT NULL,
+    brand           TEXT,
+    category_path   TEXT,
+    ean             TEXT,
+    regular_price   NUMERIC(10, 2),
+    promo_price     NUMERIC(10, 2),
+    discount_pct    NUMERIC(5, 1),
+    unit            TEXT,
+    is_available    BOOLEAN,
+    stock           INTEGER,
+    offer_tag       TEXT,
+    is_discounted   BOOLEAN,
+    is_generic      BOOLEAN,
+    prescription    BOOLEAN,
+    product_url     TEXT,
+    image_url       TEXT,
+    scraped_at      TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS price_history (
+    id              BIGSERIAL PRIMARY KEY,
+    product_id      TEXT NOT NULL,
+    store_id        TEXT NOT NULL DEFAULT '',
+    product_name    TEXT,
+    ean             TEXT,
+    regular_price   NUMERIC(10, 2),
+    promo_price     NUMERIC(10, 2),
+    discount_pct    NUMERIC(5, 1),
+    is_available    BOOLEAN,
+    offer_tag       TEXT,
+    is_discounted   BOOLEAN,
+    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ph_product  ON price_history(product_id);
+CREATE INDEX IF NOT EXISTS idx_ph_recorded ON price_history(recorded_at DESC);
+"""
+
+# Columns added in the unified schema that older per-store tables won't have.
+# ALTER TABLE … ADD COLUMN IF NOT EXISTS is idempotent on PostgreSQL 9.6+.
+_OFFERS_MIGRATIONS = [
+    ("store_id",      "TEXT NOT NULL DEFAULT ''"),
+    ("is_discounted", "BOOLEAN"),
+    ("is_generic",    "BOOLEAN"),
+    ("prescription",  "BOOLEAN"),
+    # Drogaleste originally used regular_price NOT NULL; unified schema uses nullable.
+    # The NOT NULL constraint on existing columns is NOT relaxed here — that's fine
+    # because Drogaleste always supplies a valid regular_price before upsert.
+]
+
+_HISTORY_MIGRATIONS = [
+    ("store_id",      "TEXT NOT NULL DEFAULT ''"),
+    ("is_discounted", "BOOLEAN"),
+]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _to_float(v: Any) -> Optional[float]:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_bool(v: Any) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    return None
+
+
+def _to_int(v: Any) -> Optional[int]:
+    try:
+        return int(float(v))
+    except (ValueError, TypeError):
+        return None
+
+
+def _prices_changed(
+    old_regular: Optional[float],
+    old_promo:   Optional[float],
+    new_regular: Optional[float],
+    new_promo:   Optional[float],
+) -> bool:
+    def _r(x):
+        return round(x, 2) if x is not None else None
+    return _r(old_regular) != _r(new_regular) or _r(old_promo) != _r(new_promo)
+
+
+def load_env(path: str = ".env") -> None:
+    """Minimal .env loader — sets os.environ for KEY=VALUE lines (no overwrite)."""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+
+def load_csv(path: str) -> List[Dict]:
+    with open(path, encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Base class
+# ──────────────────────────────────────────────────────────────────────────────
+
+class StoreDB:
+    """
+    Base class for per-store PostgreSQL persistence.
+
+    Subclass and set STORE_ID + DB_ENV_KEY — that's all that's required.
+
+    class MyStoreDB(StoreDB):
+        STORE_ID  = "mystore"
+        DB_ENV_KEY = "DATABASE_URL_MYSTORE"
+    """
+
+    STORE_ID:   str = ""
+    DB_ENV_KEY: str = ""
+
+    def __init__(self, database_url: Optional[str] = None):
+        url = database_url or os.environ.get(self.DB_ENV_KEY, "")
+        if not url:
+            raise RuntimeError(
+                f"{self.DB_ENV_KEY} is not set. "
+                "Add it to .env or pass database_url= explicitly."
+            )
+        self._db_url = url
+        self._conn = psycopg2.connect(url)
+        self._conn.autocommit = False
+        self._ensure_tables()
+
+    # ------------------------------------------------------------------
+
+    def _ensure_tables(self) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(_DDL)
+            for col, defn in _OFFERS_MIGRATIONS:
+                cur.execute(
+                    f"ALTER TABLE offers ADD COLUMN IF NOT EXISTS {col} {defn}"
+                )
+            for col, defn in _HISTORY_MIGRATIONS:
+                cur.execute(
+                    f"ALTER TABLE price_history ADD COLUMN IF NOT EXISTS {col} {defn}"
+                )
+            # Backfill store_id for rows created before the unified schema
+            # (ALTER TABLE sets DEFAULT '' for pre-existing rows)
+            if self.STORE_ID:
+                cur.execute(
+                    "UPDATE offers SET store_id = %s "
+                    "WHERE store_id IS NULL OR store_id = ''",
+                    (self.STORE_ID,),
+                )
+                cur.execute(
+                    "UPDATE price_history SET store_id = %s "
+                    "WHERE store_id IS NULL OR store_id = ''",
+                    (self.STORE_ID,),
+                )
+        self._conn.commit()
+        print("DB tables ready (offers, price_history).")
+
+    # ------------------------------------------------------------------
+
+    def _reconnect(self) -> None:
+        """Re-open the DB connection after an SSL/network drop."""
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        self._conn = psycopg2.connect(self._db_url)
+        self._conn.autocommit = False
+        print("  DB reconnected.")
+
+    # ------------------------------------------------------------------
+
+    def load_existing_product_ids(self) -> set:
+        """
+        Return the set of all product_ids currently in the offers table.
+        Used by scrapers to seed seen_ids on restart, enabling resume-from-checkpoint.
+        """
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT product_id FROM offers")
+                return {row[0] for row in cur.fetchall()}
+        except Exception:
+            return set()
+
+    # ------------------------------------------------------------------
+
+    def _load_existing_prices(
+        self,
+    ) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        """Returns {product_id: (regular_price, promo_price)} from current offers."""
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT product_id, regular_price, promo_price FROM offers")
+            return {
+                row[0]: (_to_float(row[1]), _to_float(row[2]))
+                for row in cur.fetchall()
+            }
+
+    # ------------------------------------------------------------------
+
+    def save(self, offers: List[Dict], batch_size: int = 200, verbose: bool = True) -> Dict[str, int]:
+        """
+        Upsert offers and append price_history rows for changed prices.
+        Returns {"upserted": N, "history_inserted": N, "skipped_zero": N}.
+        Set verbose=False for silent per-category saves (scraper chunk mode).
+        Automatically reconnects once on SSL/network drop.
+        """
+        try:
+            return self._save_impl(offers, batch_size, verbose)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            print(f"  DB connection lost ({exc.__class__.__name__}: {exc}) — reconnecting and retrying...")
+            self._reconnect()
+            return self._save_impl(offers, batch_size, verbose)
+
+    def _save_impl(self, offers: List[Dict], batch_size: int = 200, verbose: bool = True) -> Dict[str, int]:
+        now      = datetime.now(timezone.utc)
+        store_id = self.STORE_ID
+
+        # Normalize single-price scrapers: map 'price' -> 'regular_price'
+        normalized: List[Dict] = []
+        for o in offers:
+            if "price" in o and "regular_price" not in o:
+                o = {**o, "regular_price": o["price"]}
+            normalized.append(o)
+
+        # Filter out zero / null regular_price
+        valid: List[Dict] = []
+        skipped_zero = 0
+        for o in normalized:
+            rp = _to_float(o.get("regular_price"))
+            if rp is None or rp <= 0:
+                skipped_zero += 1
+                continue
+            valid.append(o)
+
+        if verbose:
+            print(f"  Offers: {len(valid):,} valid, {skipped_zero:,} skipped (zero/null price)")
+
+        existing = self._load_existing_prices()
+        if verbose:
+            print(f"  Existing rows in offers table: {len(existing):,}")
+
+        upsert_rows:  List[tuple] = []
+        history_rows: List[tuple] = []
+
+        for o in valid:
+            pid     = str(o.get("product_id", "")).strip()
+            regular = _to_float(o.get("regular_price"))
+            promo   = _to_float(o.get("promo_price"))
+            disc    = _to_float(o.get("discount_pct"))
+            avail   = _to_bool(o.get("is_available"))
+            stock   = _to_int(o.get("stock"))
+            is_disc = _to_bool(o.get("is_discounted"))
+            is_gen  = _to_bool(o.get("is_generic"))
+            prescr  = _to_bool(o.get("prescription"))
+            scraped = o.get("scraped_at") or now.isoformat()
+
+            upsert_rows.append((
+                pid,
+                store_id,
+                str(o.get("product_name",   "")).strip(),
+                str(o.get("brand",          "") or "").strip() or None,
+                str(o.get("category_path",  "") or "").strip() or None,
+                str(o.get("ean",            "") or "").strip() or None,
+                regular,
+                promo,
+                disc,
+                str(o.get("unit",           "") or "").strip() or None,
+                avail,
+                stock,
+                str(o.get("offer_tag",      "") or "").strip() or None,
+                is_disc,
+                is_gen,
+                prescr,
+                str(o.get("product_url",    "") or "").strip() or None,
+                str(o.get("image_url",      "") or "").strip() or None,
+                scraped,
+                now,
+            ))
+
+            old = existing.get(pid)
+            if old is None or _prices_changed(old[0], old[1], regular, promo):
+                history_rows.append((
+                    pid,
+                    store_id,
+                    str(o.get("product_name", "")).strip(),
+                    str(o.get("ean",          "") or "").strip() or None,
+                    regular,
+                    promo,
+                    disc,
+                    avail,
+                    str(o.get("offer_tag",    "") or "").strip() or None,
+                    is_disc,
+                    now,
+                ))
+
+        # Batch upsert offers
+        upsert_sql = """
+            INSERT INTO offers (
+                product_id, store_id, product_name, brand, category_path, ean,
+                regular_price, promo_price, discount_pct, unit,
+                is_available, stock, offer_tag, is_discounted, is_generic, prescription,
+                product_url, image_url, scraped_at, updated_at
+            ) VALUES %s
+            ON CONFLICT (product_id) DO UPDATE SET
+                store_id      = EXCLUDED.store_id,
+                product_name  = EXCLUDED.product_name,
+                brand         = EXCLUDED.brand,
+                category_path = EXCLUDED.category_path,
+                ean           = COALESCE(NULLIF(EXCLUDED.ean, ''), offers.ean),
+                regular_price = EXCLUDED.regular_price,
+                promo_price   = EXCLUDED.promo_price,
+                discount_pct  = EXCLUDED.discount_pct,
+                unit          = EXCLUDED.unit,
+                is_available  = EXCLUDED.is_available,
+                stock         = EXCLUDED.stock,
+                offer_tag     = EXCLUDED.offer_tag,
+                is_discounted = EXCLUDED.is_discounted,
+                is_generic    = EXCLUDED.is_generic,
+                prescription  = EXCLUDED.prescription,
+                product_url   = EXCLUDED.product_url,
+                image_url     = EXCLUDED.image_url,
+                scraped_at    = EXCLUDED.scraped_at,
+                updated_at    = EXCLUDED.updated_at
+        """
+
+        with self._conn.cursor() as cur:
+            for i in range(0, len(upsert_rows), batch_size):
+                batch = upsert_rows[i : i + batch_size]
+                psycopg2.extras.execute_values(cur, upsert_sql, batch)
+                if verbose:
+                    print(f"  Upserted offers batch {i // batch_size + 1}: {len(batch)} rows")
+
+        # Batch insert price_history
+        history_sql = """
+            INSERT INTO price_history (
+                product_id, store_id, product_name, ean,
+                regular_price, promo_price, discount_pct,
+                is_available, offer_tag, is_discounted, recorded_at
+            ) VALUES %s
+        """
+
+        if history_rows:
+            with self._conn.cursor() as cur:
+                for i in range(0, len(history_rows), batch_size):
+                    batch = history_rows[i : i + batch_size]
+                    psycopg2.extras.execute_values(cur, history_sql, batch)
+            if verbose:
+                print(f"  Inserted {len(history_rows):,} price_history rows.")
+        else:
+            if verbose:
+                print("  No price changes — price_history unchanged.")
+
+        self._conn.commit()
+
+        return {
+            "upserted":         len(upsert_rows),
+            "history_inserted": len(history_rows),
+            "skipped_zero":     skipped_zero,
+        }
+
+    def update_eans(self, ean_map: Dict[str, str]) -> int:
+        """
+        Bulk-update the ean column in offers for the given {product_id: ean} map.
+        Returns the number of rows updated. Reconnects once on SSL/network drop.
+        """
+        try:
+            return self._update_eans_impl(ean_map)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            print(f"  DB connection lost ({exc.__class__.__name__}: {exc}) — reconnecting and retrying...")
+            self._reconnect()
+            return self._update_eans_impl(ean_map)
+
+    def _update_eans_impl(self, ean_map: Dict[str, str]) -> int:
+        if not ean_map:
+            return 0
+        rows = [(ean, pid) for pid, ean in ean_map.items() if ean]
+        total = 0
+        with self._conn.cursor() as cur:
+            # Use execute_values to generate a single UPDATE per 500-row batch.
+            # This gives a correct cur.rowcount (unlike execute_batch which joins
+            # multiple statements and only reports the last one).
+            for i in range(0, len(rows), 500):
+                batch = rows[i:i + 500]
+                psycopg2.extras.execute_values(
+                    cur,
+                    "UPDATE offers SET ean = v.ean "
+                    "FROM (VALUES %s) AS v(ean, product_id) "
+                    "WHERE offers.product_id = v.product_id "
+                    "  AND (offers.ean IS NULL OR offers.ean = '')",
+                    batch,
+                    page_size=500,
+                )
+                total += cur.rowcount if cur.rowcount >= 0 else 0
+        self._conn.commit()
+        return total
+
+    def load_missing_eans(self) -> Dict[str, str]:
+        """
+        Returns {product_id: product_url} for all offers with no EAN yet.
+        Used by enrichment scripts to know which products still need a page fetch.
+        Reconnects once on SSL/network drop.
+        """
+        try:
+            return self._load_missing_eans_impl()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            print(f"  DB connection lost ({exc.__class__.__name__}: {exc}) — reconnecting and retrying...")
+            self._reconnect()
+            return self._load_missing_eans_impl()
+
+    def _load_missing_eans_impl(self) -> Dict[str, str]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT product_id, product_url FROM offers "
+                "WHERE (ean IS NULL OR ean = '') AND product_url IS NOT NULL AND product_url != ''"
+            )
+            return {row[0]: row[1] for row in cur.fetchall()}
+
+    def export(
+        self,
+        output_dir: str = "exports",
+        tables: Optional[List[str]] = None,
+    ) -> List[str]:
+        """
+        Dump DB tables to UTF-8-BOM CSV files (Excel-friendly).
+
+        Returns the list of file paths written.
+        Default tables: ["offers", "price_history"].
+        Files are named: <store_id>_<table>_<YYYYMMDD_HHMM>.csv
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        if tables is None:
+            tables = ["offers", "price_history"]
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        written: List[str] = []
+
+        for table in tables:
+            path = os.path.join(output_dir, f"{self.STORE_ID}_{table}_{ts}.csv")
+            with self._conn.cursor() as cur:
+                cur.execute(f"SELECT * FROM {table} ORDER BY 1")
+                cols = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(cols)
+                writer.writerows(rows)
+
+            print(f"  [{self.STORE_ID}] {table}: {len(rows):,} rows -> {path}")
+            written.append(path)
+
+        return written
+
+    def query_combined_rows(self) -> List[Dict]:
+        """
+        Return rows in the combined export format:
+          barcode, price, quantity, store_name, date_recorded, notes,
+          product_url, image_url, product_name
+
+        price       = promo_price if set, else regular_price
+        quantity    = 1 (minimum buy quantity not captured)
+        notes       = "Min:X Max:Y" from price_history (falls back to current price)
+        date_recorded = scraped_at formatted as M/D/YYYY HH:MM
+        Only rows with a non-empty EAN are included.
+        """
+        sql = """
+            SELECT
+                o.ean                                                AS barcode,
+                COALESCE(o.promo_price, o.regular_price)             AS price,
+                o.store_id                                           AS store_name,
+                o.scraped_at                                         AS date_recorded,
+                COALESCE(ph.min_price, o.regular_price)              AS hist_min,
+                COALESCE(ph.max_price, o.regular_price)              AS hist_max,
+                o.product_url,
+                o.image_url,
+                o.product_name
+            FROM offers o
+            LEFT JOIN (
+                SELECT product_id,
+                       MIN(COALESCE(promo_price, regular_price)) AS min_price,
+                       MAX(regular_price)                        AS max_price
+                FROM price_history
+                GROUP BY product_id
+            ) ph ON o.product_id = ph.product_id
+            WHERE o.ean IS NOT NULL AND o.ean != ''
+              AND o.regular_price IS NOT NULL AND o.regular_price > 0
+            ORDER BY o.ean
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(sql)
+            cols = [desc[0] for desc in cur.description]
+            raw_rows = cur.fetchall()
+
+        def _fmt(v) -> str:
+            if v is None:
+                return "0"
+            return f"{float(v):.2f}".rstrip("0").rstrip(".")
+
+        def _fmt_dt(dt) -> str:
+            if dt is None:
+                return ""
+            if isinstance(dt, str):
+                try:
+                    from datetime import timezone
+                    dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+                except ValueError:
+                    return dt
+            return f"{dt.month}/{dt.day}/{dt.year} {dt.hour:02d}:{dt.minute:02d}"
+
+        result = []
+        for raw in raw_rows:
+            r = dict(zip(cols, raw))
+            result.append({
+                "barcode":       r["barcode"],
+                "price":         _fmt(r["price"]),
+                "quantity":      1,
+                "store_name":    r["store_name"],
+                "date_recorded": _fmt_dt(r["date_recorded"]),
+                "notes":         f"Min:{_fmt(r['hist_min'])} Max:{_fmt(r['hist_max'])}",
+                "product_url":   r["product_url"] or "",
+                "image_url":     r["image_url"] or "",
+                "product_name":  r["product_name"] or "",
+            })
+        return result
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Store subclasses — add one per new drugstore
+# ──────────────────────────────────────────────────────────────────────────────
+
+class DrogalesteDB(StoreDB):
+    STORE_ID   = "drogaleste"
+    DB_ENV_KEY = "DATABASE_URL_DROGALESTE"
+
+
+class DrogasilDB(StoreDB):
+    STORE_ID   = "drogasil"
+    DB_ENV_KEY = "DATABASE_URL_DROGASIL"
+
+
+class DrogaraiaDB(StoreDB):
+    STORE_ID   = "drogaraia"
+    DB_ENV_KEY = "DATABASE_URL_DROGARAIA"
+
+
+class DrogariaSaoPauloDB(StoreDB):
+    STORE_ID   = "drogariasaopaulo"
+    DB_ENV_KEY = "DATABASE_URL_DROGARIASAOPAULO"
+
+
+class UltrafarmDB(StoreDB):
+    STORE_ID   = "ultrafarma"
+    DB_ENV_KEY = "DATABASE_URL_ULTRAFARMA"
+
+
+class PagueMenosDB(StoreDB):
+    STORE_ID   = "paguemenos"
+    DB_ENV_KEY = "DATABASE_URL_PAGUEMENOS"
+
+
+class FarmaisDB(StoreDB):
+    STORE_ID   = "farmais"
+    DB_ENV_KEY = "DATABASE_URL_FARMAIS"
+
+
+class PanvelDB(StoreDB):
+    STORE_ID   = "panvel"
+    DB_ENV_KEY = "DATABASE_URL_PANVEL"
+
+
+class FarmaciasAppDB(StoreDB):
+    STORE_ID   = "farmaciasapp"
+    DB_ENV_KEY = "DATABASE_URL_FARMACIASAPP"
+
+
+class FarmacondeDB(StoreDB):
+    STORE_ID   = "farmaconde"
+    DB_ENV_KEY = "DATABASE_URL_FARMACONDE"
+
+
+# Registry used by the CLI
+STORE_REGISTRY: Dict[str, type] = {
+    "drogaleste":       DrogalesteDB,
+    "drogasil":         DrogasilDB,
+    "drogaraia":        DrogaraiaDB,
+    "drogariasaopaulo": DrogariaSaoPauloDB,
+    "ultrafarma":       UltrafarmDB,
+    "paguemenos":       PagueMenosDB,
+    "farmais":          FarmaisDB,
+    "panvel":           PanvelDB,
+    "farmaciasapp":     FarmaciasAppDB,
+    "farmaconde":       FarmacondeDB,
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Module-level export helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+def export_all(output_dir: str = "exports") -> None:
+    """Export offers + price_history from every registered store to CSV files."""
+    for store_name, db_cls in STORE_REGISTRY.items():
+        print(f"\n[{store_name}] connecting ...")
+        try:
+            db = db_cls()
+            db.export(output_dir)
+            db.close()
+        except Exception as exc:
+            print(f"  ERROR exporting {store_name}: {exc}")
+
+
+_COMBINED_FIELDS = [
+    "barcode", "price", "quantity", "store_name",
+    "date_recorded", "notes", "product_url", "image_url", "product_name",
+]
+
+
+def export_all_together(output_dir: str = "exports") -> str:
+    """
+    Export all stores into a single combined CSV with the columns:
+      barcode, price, quantity, store_name, date_recorded, notes,
+      product_url, image_url, product_name
+
+    Only rows with a non-empty EAN (barcode) are included.
+    Returns the path of the written file.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    ts   = datetime.now().strftime("%Y%m%d_%H%M")
+    path = os.path.join(output_dir, f"all_stores_combined_{ts}.csv")
+
+    total_rows = 0
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=_COMBINED_FIELDS)
+        writer.writeheader()
+
+        for store_name, db_cls in STORE_REGISTRY.items():
+            print(f"  [{store_name}] connecting ...")
+            try:
+                db = db_cls()
+                rows = db.query_combined_rows()
+                writer.writerows(rows)
+                total_rows += len(rows)
+                print(f"  [{store_name}] {len(rows):,} rows")
+                db.close()
+            except Exception as exc:
+                print(f"  [{store_name}] ERROR: {exc}")
+
+    print(f"\nCombined export: {total_rows:,} total rows -> {path}")
+    return path
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+#
+#   push   <store> <csv_file>   — upsert a scraper CSV into the store's DB
+#   export <store>              — dump offers + price_history to CSV
+#   export-all                  — dump every registered store
+# ──────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="DB manager for pharmacy scrapers.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python -m db.db_manager push drogaleste drogaleste_20260519.csv\n"
+            "  python -m db.db_manager export drogasil\n"
+            "  python -m db.db_manager export-all --dir exports/2026-05-19"
+        ),
+    )
+    parser.add_argument("--env", default=".env", help=".env file path (default: .env)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # push
+    p_push = sub.add_parser("push", help="Upsert a scraper CSV into the store's DB")
+    p_push.add_argument("store", choices=list(STORE_REGISTRY))
+    p_push.add_argument("csv_file")
+
+    # export
+    p_exp = sub.add_parser("export", help="Dump one store's tables to CSV")
+    p_exp.add_argument("store", choices=list(STORE_REGISTRY))
+    p_exp.add_argument("--dir", default="exports", dest="output_dir",
+                       help="Output directory (default: exports/)")
+    p_exp.add_argument("--tables", nargs="+", default=None,
+                       metavar="TABLE",
+                       help="Tables to export (default: offers price_history)")
+
+    # export-all
+    p_all = sub.add_parser("export-all", help="Dump every registered store's tables to CSV")
+    p_all.add_argument("--dir", default="exports", dest="output_dir",
+                       help="Output directory (default: exports/)")
+
+    # export-all-together
+    p_tog = sub.add_parser(
+        "export-all-together",
+        help="Single combined CSV with barcode/price/store/notes columns from all stores",
+    )
+    p_tog.add_argument("--dir", default="exports", dest="output_dir",
+                       help="Output directory (default: exports/)")
+
+    args = parser.parse_args()
+    load_env(args.env)
+
+    if args.cmd == "push":
+        print(f"Loading {args.csv_file} ...")
+        offers = load_csv(args.csv_file)
+        print(f"  {len(offers):,} rows loaded")
+
+        db = STORE_REGISTRY[args.store]()
+        stats = db.save(offers)
+        db.close()
+
+        print(f"\nDone.")
+        print(f"  Upserted to offers:     {stats['upserted']:,}")
+        print(f"  New price_history rows: {stats['history_inserted']:,}")
+        print(f"  Skipped (zero price):   {stats['skipped_zero']:,}")
+
+    elif args.cmd == "export":
+        db = STORE_REGISTRY[args.store]()
+        paths = db.export(args.output_dir, args.tables)
+        db.close()
+        print(f"\nExported {len(paths)} file(s) to {args.output_dir}/")
+
+    elif args.cmd == "export-all":
+        export_all(args.output_dir)
+        print(f"\nAll stores exported to {args.output_dir}/")
+
+    elif args.cmd == "export-all-together":
+        export_all_together(args.output_dir)

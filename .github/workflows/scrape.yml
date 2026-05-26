@@ -1,7 +1,7 @@
 # .github/workflows/scrape.yml
 #
 # Per-store scraper workflow — injected into each store repo by deploy/deploy.py.
-# The cron schedule is replaced by deploy.py (0 08 * * * -> actual value).
+# The cron schedule is replaced by deploy.py (0 16 * * * -> actual value).
 #
 # Secrets required in each store repo (set automatically by deploy.py):
 #   STORE_KEY               — store key, e.g. "drogaleste"
@@ -13,7 +13,7 @@ name: Scrape
 
 on:
   schedule:
-    - cron: '0 08 * * *'   # 13:00 BRT (16:00 UTC) — set by deploy.py
+    - cron: '0 16 * * *'   # 13:00 BRT (16:00 UTC) — set by deploy.py
   workflow_dispatch:
     inputs:
       limit:

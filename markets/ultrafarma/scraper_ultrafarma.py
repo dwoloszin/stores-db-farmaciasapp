@@ -34,7 +34,11 @@ STORE_ID  = "ultrafarma"
 PAGE_SIZE = 12    # products per category page
 DELAY     = 0.4   # seconds between requests
 
-GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -44,10 +48,13 @@ GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/b
 def _make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent":      GOOGLEBOT_UA,
+        "User-Agent":      BROWSER_UA,
         "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "pt-BR,pt;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
+        "sec-fetch-dest":  "document",
+        "sec-fetch-mode":  "navigate",
+        "sec-fetch-site":  "none",
     })
     return s
 
@@ -56,53 +63,70 @@ def _make_session() -> requests.Session:
 # Category tree
 # ──────────────────────────────────────────────────────────────────────────────
 
-def fetch_category_tree(session: requests.Session) -> List[Dict]:
-    """
-    Parses the homepage navigation to build a flat list of all leaf categories.
-    Returns dicts with: url_path, name, full_path.
-
-    Includes all /categoria/parent/child and /categoria/parent/child/sub paths.
-    Excludes top-level /categoria/parent URLs (they duplicate children).
-    Uses seen_urls deduplication so each URL appears only once.
-    """
-    r = session.get(BASE_URL, timeout=25)
-    r.raise_for_status()
-    html = r.text
-
-    # Extract all /categoria/ hrefs from the navigation
+def _parse_category_links(html: str) -> List[Dict]:
     raw_links = re.findall(r'href="(/categoria/[^"?#]+)"', html)
-
     seen: set = set()
     categories: List[Dict] = []
-
     for link in raw_links:
         link = link.rstrip("/")
         if link in seen:
             continue
         seen.add(link)
-
-        parts = link.split("/")   # ['', 'categoria', 'parent', 'child', ...]
-        depth = len(parts) - 2    # number of path segments after /categoria/
-
-        # Skip top-level parents (/categoria/medicamentos etc.) — their products
-        # are all in sub-categories; scraping parents would yield duplicates.
-        if depth < 2:
+        parts = link.split("/")
+        if len(parts) - 2 < 2:   # skip top-level /categoria/parent
             continue
-
-        # Build human-readable full_path from URL slugs
-        slug_parts = parts[2:]    # ['medicamentos', 'dor-e-contusao', ...]
-        full_path = " > ".join(
-            s.replace("-", " ").title() for s in slug_parts
-        )
-        name = slug_parts[-1].replace("-", " ").title()
-
+        slug_parts = parts[2:]
         categories.append({
             "url_path":  link,
-            "name":      name,
-            "full_path": full_path,
+            "name":      slug_parts[-1].replace("-", " ").title(),
+            "full_path": " > ".join(s.replace("-", " ").title() for s in slug_parts),
         })
-
     return categories
+
+
+def _fetch_categories_from_sitemap(session: requests.Session) -> List[Dict]:
+    """Fallback: extract /categoria/ paths from the XML sitemap."""
+    import xml.etree.ElementTree as ET
+    _NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+    for url in (f"{BASE_URL}/sitemap.xml", f"{BASE_URL}/sitemap_index.xml"):
+        try:
+            r = session.get(url, timeout=25)
+            if r.status_code != 200:
+                continue
+            root = ET.fromstring(r.content)
+            locs = [loc.text.strip() for loc in root.findall(".//sm:loc", _NS) if loc.text]
+            links = []
+            for loc in locs:
+                path = loc.replace(BASE_URL, "")
+                if "/categoria/" in path:
+                    links.append(f'href="{path}"')
+            if links:
+                return _parse_category_links(" ".join(links))
+        except Exception:
+            continue
+    return []
+
+
+def fetch_category_tree(session: requests.Session) -> List[Dict]:
+    """
+    Build a flat list of leaf categories from the homepage navigation.
+    Falls back to the XML sitemap if the homepage returns a non-200 status.
+    """
+    r = session.get(BASE_URL, timeout=25)
+    if r.status_code == 200:
+        categories = _parse_category_links(r.text)
+        if categories:
+            return categories
+
+    print(f"  WARNING: homepage returned HTTP {r.status_code} — trying sitemap fallback.")
+    categories = _fetch_categories_from_sitemap(session)
+    if categories:
+        print(f"  Sitemap fallback: found {len(categories)} categories.")
+        return categories
+
+    r.raise_for_status()   # re-raise original error if both sources failed
+    return []
 
 
 # ──────────────────────────────────────────────────────────────────────────────

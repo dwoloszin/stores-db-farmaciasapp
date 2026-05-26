@@ -166,7 +166,7 @@ def _to_int(v: Any) -> Optional[int]:
 def load_env(path: str = ".env") -> None:
     """Minimal .env loader — sets os.environ for KEY=VALUE lines (no overwrite)."""
     try:
-        with open(path) as f:
+        with open(path, encoding="latin-1") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:

@@ -75,6 +75,7 @@ def _typesense_search(
     *,
     department: str,
     page: int,
+    attempt: int = 0,
 ) -> Dict[str, Any]:
     payload = {
         "searches": [{
@@ -97,9 +98,12 @@ def _typesense_search(
         },
     )
     if r.status_code == 429:
+        if attempt >= 5:
+            print(f"    Rate limited 5x on {department} — giving up")
+            return {"found": 0, "hits": []}
         print(f"    Rate limited on {department} — sleeping 10s")
         time.sleep(10)
-        return _typesense_search(session, department=department, page=page)
+        return _typesense_search(session, department=department, page=page, attempt=attempt + 1)
     r.raise_for_status()
 
     result = r.json()["results"][0]
@@ -317,7 +321,7 @@ def _standardize_doc(doc: Dict) -> Optional[Dict]:
 
 
 def _lookup_slug(session: requests.Session, slug: str) -> Optional[Dict]:
-    def _query(payload: Dict[str, Any]) -> List[Dict]:
+    def _query(payload: Dict[str, Any], attempt: int = 0) -> List[Dict]:
         r = session.post(
             f"{TYPESENSE_URL}/multi_search",
             json=payload,
@@ -328,9 +332,11 @@ def _lookup_slug(session: requests.Session, slug: str) -> Optional[Dict]:
             },
         )
         if r.status_code == 429:
+            if attempt >= 5:
+                return []
             print(f"    Rate limited on {slug} — sleeping 10s")
             time.sleep(10)
-            return _query(payload)
+            return _query(payload, attempt + 1)
         r.raise_for_status()
         return r.json()["results"][0].get("hits") or []
 
@@ -377,8 +383,8 @@ _TS_HEADERS = {
 
 
 def _ts_post(session: requests.Session, payload: Dict) -> Dict:
-    """POST to multi_search with automatic 429 back-off."""
-    while True:
+    """POST to multi_search with automatic 429 back-off (max 8 tries)."""
+    for _try in range(8):
         r = session.post(
             f"{TYPESENSE_URL}/multi_search",
             json=payload,
@@ -391,6 +397,7 @@ def _ts_post(session: requests.Session, payload: Dict) -> Dict:
             continue
         r.raise_for_status()
         return r.json()
+    raise RuntimeError("multi_search: rate limited 8x — aborting")
 
 
 def _fetch_docs_by_departments(

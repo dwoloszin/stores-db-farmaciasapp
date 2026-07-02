@@ -122,6 +122,7 @@ def _fetch_page(
     session: requests.Session,
     fq:      str,
     from_:   int,
+    attempt: int = 0,
 ) -> Tuple[List[Dict], int]:
     """Returns (items, total_in_category). Handles rate-limit retry."""
     to_ = min(from_ + PAGE_SIZE - 1, VTEX_CAP)
@@ -131,9 +132,12 @@ def _fetch_page(
         timeout=30,
     )
     if r.status_code == 429:
+        if attempt >= 5:
+            print("    Rate limited 5x — giving up on this page")
+            return [], 0
         print("    Rate limited — sleeping 10s")
         time.sleep(10)
-        return _fetch_page(session, fq, from_)
+        return _fetch_page(session, fq, from_, attempt + 1)
     if r.status_code not in (200, 206):
         return [], 0
 

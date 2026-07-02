@@ -156,6 +156,7 @@ def _fetch_page(
     sub_slug:   str,
     cat_id:     int,
     page:       int,
+    attempt:    int = 0,
 ) -> Tuple[List[Dict], int, int]:
     """Returns (items, total_items, total_pages). Handles rate-limit retry."""
     body = {
@@ -177,9 +178,12 @@ def _fetch_page(
         timeout=30,
     )
     if r.status_code == 429:
+        if attempt >= 5:
+            print("    Rate limited 5x — giving up on this page")
+            return [], 0, 0
         print("    Rate limited — sleeping 15s")
         time.sleep(15)
-        return _fetch_page(session, session_id, dept_slug, sub_slug, cat_id, page)
+        return _fetch_page(session, session_id, dept_slug, sub_slug, cat_id, page, attempt + 1)
     if r.status_code not in (200,):
         return [], 0, 0
 

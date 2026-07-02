@@ -11,6 +11,11 @@
 
 name: Scrape
 
+# Never run two scrapes at once (scheduled + manual, or a run that overruns)
+concurrency:
+  group: scrape
+  cancel-in-progress: false
+
 on:
   schedule:
     - cron: '0 16 * * *'   # 13:00 BRT (16:00 UTC) — set by deploy.py
@@ -81,3 +86,7 @@ jobs:
           fi
 
           python -m main $ARGS
+
+      - name: Prune old price history
+        if: success()
+        run: python -m db.db_manager prune "${{ secrets.STORE_KEY }}" --days 180

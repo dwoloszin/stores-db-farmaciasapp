@@ -118,6 +118,7 @@ def _fetch_category_page(
     session:  requests.Session,
     cat_id:   int,
     from_:    int,
+    attempt:  int = 0,
 ) -> Tuple[List[Dict], int]:
     """
     Returns (products, total_count).
@@ -131,9 +132,12 @@ def _fetch_category_page(
     )
 
     if r.status_code == 429:
+        if attempt >= 5:
+            print("    Rate limited 5x — giving up on this page")
+            return [], 0
         print("    Rate limited — sleeping 15s")
         time.sleep(15)
-        return _fetch_category_page(session, cat_id, from_)
+        return _fetch_category_page(session, cat_id, from_, attempt + 1)
 
     if r.status_code not in (200, 206):
         print(f"    HTTP {r.status_code} for cat={cat_id} from={from_}")

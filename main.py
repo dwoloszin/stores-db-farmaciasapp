@@ -492,7 +492,7 @@ def _extract_progress_percent(log_path: Optional[Path]) -> Optional[float]:
 def _load_env(path: str = ".env") -> None:
     """Load .env into os.environ so subprocesses inherit the vars."""
     try:
-        with open(path) as f:
+        with open(path, encoding="latin-1") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:

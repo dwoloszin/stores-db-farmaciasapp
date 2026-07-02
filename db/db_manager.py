@@ -535,6 +535,30 @@ class StoreDB:
             })
         return result
 
+    def prune_history(self, days: int = 180) -> int:
+        """
+        Delete price_history rows older than `days`, but always keep each
+        product's oldest surviving price point intact (the latest row per
+        product is never older than the last scrape anyway).
+        Returns the number of rows deleted.
+        Keeps the DB under NeonDB's free-tier size limit.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM price_history
+                WHERE recorded_at < NOW() - make_interval(days => %s)
+                  AND id NOT IN (
+                      SELECT MIN(id) FROM price_history GROUP BY product_id
+                  )
+                """,
+                (days,),
+            )
+            deleted = cur.rowcount
+        self._conn.commit()
+        print(f"  Pruned {deleted:,} price_history rows older than {days} days.")
+        return deleted
+
     def close(self) -> None:
         self._conn.close()
 
@@ -715,6 +739,15 @@ if __name__ == "__main__":
     p_tog.add_argument("--dir", default="exports", dest="output_dir",
                        help="Output directory (default: exports/)")
 
+    # prune
+    p_prune = sub.add_parser(
+        "prune",
+        help="Delete old price_history rows (keeps each product's first price point)",
+    )
+    p_prune.add_argument("store", choices=list(STORE_REGISTRY) + ["all"])
+    p_prune.add_argument("--days", type=int, default=180,
+                         help="Delete history older than N days (default: 180)")
+
     args = parser.parse_args()
     load_env(args.env)
 
@@ -744,3 +777,14 @@ if __name__ == "__main__":
 
     elif args.cmd == "export-all-together":
         export_all_together(args.output_dir)
+
+    elif args.cmd == "prune":
+        stores = list(STORE_REGISTRY) if args.store == "all" else [args.store]
+        for store in stores:
+            print(f"[{store}] pruning history older than {args.days} days ...")
+            try:
+                db = STORE_REGISTRY[store]()
+                db.prune_history(args.days)
+                db.close()
+            except Exception as exc:
+                print(f"[{store}] ERROR: {exc}")

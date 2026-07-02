@@ -137,6 +137,7 @@ def _fetch_category_page(
     session:  requests.Session,
     url_path: str,
     page_num: int,
+    attempt:  int = 0,
 ) -> List[Dict]:
     """
     Fetches one category page and returns a list of raw product dicts.
@@ -149,18 +150,25 @@ def _fetch_category_page(
             timeout=45,
         )
     except requests.exceptions.Timeout:
+        if attempt >= 5:
+            return []
         print(f"    Timeout on {url_path}?pg={page_num} — retrying in 15s")
         time.sleep(15)
-        return _fetch_category_page(session, url_path, page_num)
+        return _fetch_category_page(session, url_path, page_num, attempt + 1)
     except requests.exceptions.ConnectionError:
+        if attempt >= 5:
+            return []
         print(f"    Connection error on {url_path}?pg={page_num} — retrying in 20s")
         time.sleep(20)
-        return _fetch_category_page(session, url_path, page_num)
+        return _fetch_category_page(session, url_path, page_num, attempt + 1)
 
     if r.status_code == 429:
+        if attempt >= 5:
+            print("    Rate limited 5x — giving up on this page")
+            return []
         print("    Rate limited — sleeping 15s")
         time.sleep(15)
-        return _fetch_category_page(session, url_path, page_num)
+        return _fetch_category_page(session, url_path, page_num, attempt + 1)
 
     if r.status_code not in (200, 206):
         print(f"    HTTP {r.status_code} for {url_path}?pg={page_num}")

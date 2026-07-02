@@ -53,7 +53,7 @@ def _get_session() -> tuple:
     return _local.session, _local.session_id
 
 
-def _fetch_ean(product_id: str) -> Optional[str]:
+def _fetch_ean(product_id: str, attempt: int = 0) -> Optional[str]:
     """Return EAN string for the given panvelCode, or None on failure."""
     session, session_id = _get_session()
     try:
@@ -69,8 +69,10 @@ def _fetch_ean(product_id: str) -> Optional[str]:
             timeout=15,
         )
         if r.status_code == 429:
+            if attempt >= 5:
+                return None
             time.sleep(10)
-            return _fetch_ean(product_id)
+            return _fetch_ean(product_id, attempt + 1)
         if r.status_code != 200:
             return None
         ean = r.json().get("ean") or ""

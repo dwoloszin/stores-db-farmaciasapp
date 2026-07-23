@@ -18,7 +18,7 @@ concurrency:
 
 on:
   schedule:
-    - cron: '5 */3 * * *'   # 13:00 BRT (16:00 UTC) — set by deploy.py
+    - cron: '5 */3 * * *'   # per-store frequency tier — set by deploy.py (see STORE_SCHEDULE)
   workflow_dispatch:
     inputs:
       limit:

@@ -1,0 +1,40 @@
+name: Diag
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe Typesense from Actions IP
+        shell: python
+        run: |
+          import urllib.request, json
+          URL = "https://search-lb.main.mkplace.com.br/multi_search"
+          KEY = "9sUhPk3OEt7l3KJghC2YlaYF3zXw5kUD"
+          COLL = "col-V-kS_pcI8C-V-kS_pcI8C-search"
+
+          def probe(label, headers):
+              payload = {"searches":[{"q":"*","query_by":"*","per_page":2,"page":1,"collection":COLL}]}
+              req = urllib.request.Request(URL, data=json.dumps(payload).encode(),
+                                           headers={"Content-Type":"application/json",
+                                                    "X-TYPESENSE-API-KEY":KEY, **headers})
+              try:
+                  r = urllib.request.urlopen(req, timeout=30)
+                  body = r.read().decode("utf-8","ignore")
+                  res = json.loads(body).get("results",[{}])[0]
+                  print(f"[{label}] HTTP {r.status} | found={res.get('found')} | hits={len(res.get('hits') or [])} | preview={body[:120]}")
+              except urllib.error.HTTPError as e:
+                  print(f"[{label}] HTTPError {e.code}: {e.read()[:200]}")
+              except Exception as e:
+                  print(f"[{label}] ERROR {type(e).__name__}: {e}")
+
+          probe("plain", {})
+          probe("browser-UA", {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"})
+          probe("with-origin", {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0",
+                                "Origin":"https://www.farmaciasapp.com.br",
+                                "Referer":"https://www.farmaciasapp.com.br/"})
+
+      - name: Show runner public IP
+        run: curl -s https://api.ipify.org; echo

@@ -66,3 +66,17 @@ Schedules are configured in `deploy/deploy.py` (`STORE_SCHEDULE`, UTC).
 
 All credentials live in `.env` (never committed) and in GitHub Actions
 secrets. See `.env.template` for the required variables.
+
+
+
+Store	Frequency	Cron (UTC)
+farmaciasapp	every 3h (8×/day)	5 */3 * * *
+farmaconde	every 3h (8×/day)	10 */3 * * *
+drogaleste	every 4h (6×/day)	15 */4 * * *
+paguemenos	every 4h (6×/day)	20 */4 * * *
+farmais	every 4h (6×/day)	25 */4 * * *
+panvel	every 4h (6×/day)	30 */4 * * *
+drogariasaopaulo	every 6h (4×/day)	35 */6 * * *
+drogasil	every 8h (3×/day)	40 */8 * * *
+ultrafarma	every 8h (3×/day)	45 */8 * * *
+drogaraia	every 8h (3×/day)	50 */8 * * *

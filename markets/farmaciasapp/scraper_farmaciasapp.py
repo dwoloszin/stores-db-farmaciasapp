@@ -36,7 +36,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 BASE_URL = "https://www.farmaciasapp.com.br"
 STORE_ID = "farmaciasapp"
-TYPESENSE_URL = "https://search-lb.main.mkplace.com.br"
+TYPESENSE_URL = "https://search-secondary.main.mkplace.com.br"
 TYPESENSE_API_KEY = "9sUhPk3OEt7l3KJghC2YlaYF3zXw5kUD"
 TYPESENSE_COLLECTION = "col-V-kS_pcI8C-V-kS_pcI8C-search"
 PER_PAGE            = 250

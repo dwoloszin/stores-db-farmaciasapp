@@ -617,6 +617,51 @@ class FarmacondeDB(StoreDB):
     DB_ENV_KEY = "DATABASE_URL_FARMACONDE"
 
 
+class EualiriaDB(StoreDB):
+    STORE_ID   = "eualiria"
+    DB_ENV_KEY = "DATABASE_URL_EUALIRIA"
+
+
+class AgillemedDB(StoreDB):
+    STORE_ID   = "agillemed"
+    DB_ENV_KEY = "DATABASE_URL_AGILLEMED"
+
+
+class NovamedDB(StoreDB):
+    STORE_ID   = "novamed"
+    DB_ENV_KEY = "DATABASE_URL_NOVAMED"
+
+
+class PharmedDB(StoreDB):
+    STORE_ID   = "pharmed"
+    DB_ENV_KEY = "DATABASE_URL_PHARMED"
+
+
+class JustMedicamentosDB(StoreDB):
+    STORE_ID   = "justmedicamentos"
+    DB_ENV_KEY = "DATABASE_URL_JUSTMEDICAMENTOS"
+
+
+class GhfarmaDB(StoreDB):
+    STORE_ID   = "ghfarma"
+    DB_ENV_KEY = "DATABASE_URL_GHFARMA"
+
+
+class LevittaDB(StoreDB):
+    STORE_ID   = "levitta"
+    DB_ENV_KEY = "DATABASE_URL_LEVITTA"
+
+
+class DinamicaDB(StoreDB):
+    STORE_ID   = "dinamica"
+    DB_ENV_KEY = "DATABASE_URL_DINAMICA"
+
+
+class FacilitaDB(StoreDB):
+    STORE_ID   = "facilita"
+    DB_ENV_KEY = "DATABASE_URL_FACILITA"
+
+
 # Registry used by the CLI
 STORE_REGISTRY: Dict[str, type] = {
     "drogaleste":       DrogalesteDB,
@@ -629,6 +674,15 @@ STORE_REGISTRY: Dict[str, type] = {
     "panvel":           PanvelDB,
     "farmaciasapp":     FarmaciasAppDB,
     "farmaconde":       FarmacondeDB,
+    "eualiria":         EualiriaDB,
+    "agillemed":        AgillemedDB,
+    "novamed":          NovamedDB,
+    "pharmed":          PharmedDB,
+    "justmedicamentos": JustMedicamentosDB,
+    "ghfarma":          GhfarmaDB,
+    "levitta":          LevittaDB,
+    "dinamica":         DinamicaDB,
+    "facilita":         FacilitaDB,
 }
 
 

@@ -43,6 +43,15 @@ _STORES: Dict[str, List[str]] = {
     "farmais":          [sys.executable, "-m", "markets.farmais.scraper_farmais"],
     "panvel":           [sys.executable, "-m", "markets.panvel.scraper_panvel"],
     "farmaciasapp":     [sys.executable, "-m", "markets.farmaciasapp.scraper_farmaciasapp"],
+    "eualiria":         [sys.executable, "-m", "markets.eualiria.scraper_eualiria"],
+    "agillemed":        [sys.executable, "-m", "markets.agillemed.scraper_agillemed"],
+    "novamed":          [sys.executable, "-m", "markets.novamed.scraper_novamed"],
+    "pharmed":          [sys.executable, "-m", "markets.pharmed.scraper_pharmed"],
+    "justmedicamentos": [sys.executable, "-m", "markets.justmedicamentos.scraper_justmedicamentos"],
+    "ghfarma":          [sys.executable, "-m", "markets.ghfarma.scraper_ghfarma"],
+    "levitta":          [sys.executable, "-m", "markets.levitta.scraper_levitta"],
+    "dinamica":         [sys.executable, "-m", "markets.dinamica.scraper_dinamica"],
+    "facilita":         [sys.executable, "-m", "markets.facilita.scraper_facilita"],
 }
 
 # Stores whose EAN must be enriched from product pages after scraping
@@ -52,6 +61,11 @@ _EAN_ENRICHERS: Dict[str, List[str]] = {
     "farmaconde": [sys.executable, "-m", "markets.farmaconde.enrich_ean_farmaconde"],
     "ultrafarma":[sys.executable, "-m", "markets.ultrafarma.enrich_ean_ultrafarma"],
     "panvel":    [sys.executable, "-m", "markets.panvel.enrich_ean_panvel"],
+    "eualiria":  [sys.executable, "-m", "markets.eualiria.enrich_ean_eualiria"],
+    "novamed":   [sys.executable, "-m", "markets.novamed.enrich_ean_novamed"],
+    "pharmed":   [sys.executable, "-m", "markets.pharmed.enrich_ean_pharmed"],
+    "dinamica":  [sys.executable, "-m", "markets.dinamica.enrich_ean_dinamica"],
+    "facilita":  [sys.executable, "-m", "markets.facilita.enrich_ean_facilita"],
 }
 
 

@@ -36,6 +36,7 @@ sys.stdout.reconfigure(line_buffering=True)
 BASE_URL   = "https://www.drogariasaopaulo.com.br"
 STORE_ID   = "drogariasaopaulo"
 PAGE_SIZE  = 50     # items per VTEX page (_to - _from + 1)
+PRICE_SENTINEL = 9_999_000  # VTEX "price not available" placeholder (real price is in Price)
 VTEX_CAP   = 2550   # hard VTEX limit: _to cannot exceed 2549
 DELAY      = 0.25   # seconds between requests
 
@@ -184,6 +185,12 @@ def _standardize(raw: Dict, cat_label: str) -> Optional[Dict]:
 
     regular = _to_float(offer.get("ListPrice"))
     promo   = _to_float(offer.get("Price"))
+    # Some rows return a sentinel ListPrice (e.g. 9999876) with the real
+    # price in Price; treat the sentinel as "no regular price" and promote
+    # the real price to regular so no phantom discount is recorded.
+    if regular and regular >= PRICE_SENTINEL:
+        regular = promo
+        promo = None
     if not regular or regular <= 0:
         return None
     if promo and promo >= regular:

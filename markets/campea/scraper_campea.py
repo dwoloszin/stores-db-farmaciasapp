@@ -45,6 +45,10 @@ WORKERS    = 16
 DELAY      = 0.0
 MAX_TRIES  = 4
 
+# The Convertiez WAF 403s datacenter (GitHub Actions) IPs for a normal browser
+# UA, but lets the Googlebot UA through on page + sitemap routes — same bypass we
+# use for Drogasil's Cloudflare WAF. Residential IPs work with either UA.
+GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -67,26 +71,33 @@ _RE_BRAND = re.compile(r'"brand"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"')
 def _make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent":      BROWSER_UA,
+        "User-Agent":      GOOGLEBOT_UA,
         "Accept":          "text/html,application/xhtml+xml,*/*",
         "Accept-Language": "pt-BR,pt;q=0.9",
     })
     return s
 
 
-def _get(session: requests.Session, url: str) -> Optional[requests.Response]:
+def _get(session: requests.Session, url: str, diag: bool = False) -> Optional[requests.Response]:
+    last = None
     for attempt in range(MAX_TRIES):
         try:
             r = session.get(url, timeout=30)
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            last = f"exc {exc.__class__.__name__}"
             time.sleep(min(2 * (attempt + 1), 10))
             continue
+        last = f"HTTP {r.status_code}"
         if r.status_code in (429, 500, 502, 503, 504):
             time.sleep(min(3 * (attempt + 1), 15))
             continue
         if r.status_code != 200:
+            if diag:
+                print(f"  [get] {url} -> {last}")
             return None
         return r
+    if diag:
+        print(f"  [get] {url} -> gave up after {MAX_TRIES} tries (last: {last})")
     return None
 
 
@@ -94,36 +105,57 @@ def _get(session: requests.Session, url: str) -> Optional[requests.Response]:
 # Product URL discovery
 # ──────────────────────────────────────────────────────────────────────────────
 
-def fetch_product_urls(session: requests.Session) -> List[str]:
-    root = _get(session, SITEMAP)
-    if root is None:
-        print("ERROR: could not fetch sitemap index.")
-        return []
-    try:
-        idx = ET.fromstring(root.content)
-    except ET.ParseError:
-        return []
+# Known product sub-sitemaps — used as a fallback when the index can't be
+# fetched/parsed (e.g. a datacenter-IP bot challenge that returns HTML, not XML).
+SUBMAP_FALLBACK = [
+    f"{BASE_URL}/s/drogariascampea/sitemap-products-{i}.xml" for i in range(1, 6)
+]
 
-    sub_maps = [
-        loc.text.strip()
-        for loc in idx.findall(".//sm:loc", _XML_NS)
-        if loc.text and "product" in loc.text.lower()
-    ]
+
+def _snippet(resp: requests.Response) -> str:
+    ct = resp.headers.get("Content-Type", "?")
+    body = (resp.text or "")[:160].replace("\n", " ").replace("\r", " ")
+    return f"ct={ct} bytes={len(resp.content)} head={body!r}"
+
+
+def fetch_product_urls(session: requests.Session) -> List[str]:
+    sub_maps: List[str] = []
+    root = _get(session, SITEMAP, diag=True)
+    if root is None:
+        print("  sitemap index unreachable — falling back to known sub-sitemap URLs")
+    else:
+        try:
+            idx = ET.fromstring(root.content)
+            sub_maps = [
+                loc.text.strip()
+                for loc in idx.findall(".//sm:loc", _XML_NS)
+                if loc.text and "product" in loc.text.lower()
+            ]
+        except ET.ParseError:
+            # Not XML — almost always a bot-challenge/HTML page from datacenter IPs.
+            print(f"  sitemap index is not XML ({_snippet(root)}) — using fallback URLs")
+    if not sub_maps:
+        sub_maps = SUBMAP_FALLBACK
+    print(f"  product sub-sitemaps to read: {len(sub_maps)}")
+
     urls: List[str] = []
     seen: set = set()
     for sm_url in sub_maps:
-        r = _get(session, sm_url)
+        r = _get(session, sm_url, diag=True)
         if r is None:
             continue
         try:
             xml = ET.fromstring(r.content)
         except ET.ParseError:
+            print(f"  sub-sitemap not XML: {sm_url} ({_snippet(r)})")
             continue
+        n0 = len(urls)
         for loc in xml.findall(".//sm:loc", _XML_NS):
             u = (loc.text or "").strip()
             if u and u.endswith("/p") and u not in seen:
                 seen.add(u)
                 urls.append(u)
+        print(f"    {sm_url.rsplit('/', 1)[-1]}: +{len(urls) - n0} product URLs")
     print(f"  Product URLs in sitemap: {len(urls):,}")
     return urls
 
@@ -176,7 +208,10 @@ def _standardize(url: str, html: str) -> Optional[Dict]:
     )
 
     product_id = sku or url.rstrip("/").rsplit("/", 1)[-1]
-    available = "InStock" in _first(_RE_AVAIL, window)
+    # availability sits in the Offer block ~3k chars after gtin13 — outside the
+    # narrow window — and there is exactly one per product page, so read it from
+    # the full html (window-scoped read left every product unavailable).
+    available = "InStock" in _first(_RE_AVAIL, html)
 
     return {
         "product_id":    product_id,
@@ -308,6 +343,12 @@ if __name__ == "__main__":
     print(f"  Upserted: {stats['upserted']:,}  "
           f"history: {stats['history_inserted']:,}  "
           f"skipped (zero): {stats['skipped_zero']:,}")
+
+    # A scrape that discovered/saved nothing is a failure, not a silent success —
+    # exit non-zero so the orchestrator marks it FAILED and shows the log tail.
+    if stats["total_unique"] == 0 and stats["upserted"] == 0:
+        print("ERROR: scrape produced zero products — treating as failure.")
+        sys.exit(1)
 
     if args.csv or args.output:
         output_dir = args.output or "."

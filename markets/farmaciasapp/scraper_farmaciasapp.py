@@ -111,57 +111,39 @@ def _count(session: requests.Session, fqs: List[str]) -> int:
 # Category planning (walk tree + price subdivision for capped categories)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _price_buckets(session: requests.Session, cat_fq: str, lo: float, hi: float,
+def _price_buckets(session: requests.Session, base_fqs: List[str], lo: float, hi: float,
                    out: List[List[str]], depth: int = 0) -> None:
-    fqs = [cat_fq, f"P:[{lo} TO {hi}]"]
+    """Recursively split price range [lo,hi] until each bucket holds <= VTEX_CAP."""
+    fqs = base_fqs + [f"P:[{lo} TO {hi}]"]
     total = _count(session, fqs)
     time.sleep(DELAY)
     if total <= 0:
         return
-    if total <= VTEX_CAP or depth >= 20 or (hi - lo) <= 0.02:
+    if total <= VTEX_CAP or depth >= 24 or (hi - lo) <= 0.02:
         out.append(fqs)
         return
     mid = round((lo + hi) / 2, 2)
     if mid <= lo or mid >= hi:
         out.append(fqs)
         return
-    _price_buckets(session, cat_fq, lo, mid, out, depth + 1)
-    _price_buckets(session, cat_fq, mid, hi, out, depth + 1)
+    _price_buckets(session, base_fqs, lo, mid, out, depth + 1)
+    _price_buckets(session, base_fqs, mid, hi, out, depth + 1)
 
 
-def flatten_categories(session: requests.Session) -> List[Tuple[int, str]]:
-    """Return [(category_id, label)] from the VTEX tree (leaves + parents)."""
-    tree = session.get(f"{API_HOST}/api/catalog_system/pub/category/tree/50",
-                       timeout=30).json()
-    cats: List[Tuple[int, str]] = []
-    seen_ids: set = set()
+def plan_targets(session: requests.Session) -> List[List[str]]:
+    """Whole-catalogue plan: subdivide the FULL catalogue by price ONCE.
 
-    def walk(node: Dict, path: str) -> None:
-        cid = node["id"]
-        name = node.get("name") or ""
-        label = f"{path}/{name}" if path else name
-        if cid not in seen_ids:
-            seen_ids.add(cid)
-            cats.append((cid, label))
-        for ch in node.get("children") or []:
-            walk(ch, label)
-
-    for top in tree:
-        walk(top, "")
-    return cats
-
-
-def category_targets(session: requests.Session, cid: int) -> List[List[str]]:
-    """fq target(s) for one category — direct, or price-subdivided if over cap."""
-    cat_fq = f"C:/{cid}/"
-    total = _count(session, [cat_fq])
-    time.sleep(DELAY)
-    if total <= 0:
-        return []
-    if total <= VTEX_CAP:
-        return [[cat_fq]]
+    Far cheaper than a per-category walk (~63 count calls vs ~1000): the store's
+    ~74k products all sit under the top categories, so a single global price
+    subdivision reaches every product. category_path comes from each product's own
+    `categories` field, so we don't need the category tree at all. Datacenter
+    latency makes count calls the dominant cost — minimising them is what keeps the
+    GitHub run well under the 60min bar.
+    """
+    total = _count(session, [])
+    print(f"  Catalogue total: {total:,} — subdividing by price ...")
     buckets: List[List[str]] = []
-    _price_buckets(session, cat_fq, 0.0, float(PRICE_MAX), buckets)
+    _price_buckets(session, [], 0.0, float(PRICE_MAX), buckets)
     return buckets
 
 
@@ -241,9 +223,9 @@ def scrape(db, limit: Optional[int] = None) -> Dict:
     seen_pids: set = set()
     total_saved = total_upserted = total_history = total_skipped = 0
 
-    print("Fetching category tree ...")
-    cats = flatten_categories(session)
-    print(f"  Categories: {len(cats)}")
+    print("Planning price buckets over the whole catalogue ...")
+    targets = plan_targets(session)
+    print(f"  Price buckets to page: {len(targets)}")
 
     batch: List[Dict] = []
 
@@ -282,15 +264,12 @@ def scrape(db, limit: Optional[int] = None) -> Dict:
             if limit and len(seen_pids) >= limit:
                 break
 
-    for ci, (cid, label) in enumerate(cats, 1):
-        for fqs in category_targets(session, cid):
-            _scrape_target(fqs, label)
-            if len(batch) >= 300:
-                _flush()
-            if limit and len(seen_pids) >= limit:
-                break
-        if ci % 50 == 0:
-            print(f"  [cat {ci}/{len(cats)}] unique so far: {len(seen_pids):,}  saved: {total_saved:,}")
+    for ti, fqs in enumerate(targets, 1):
+        _scrape_target(fqs, "")
+        if len(batch) >= 300:
+            _flush()
+        if ti % 20 == 0:
+            print(f"  [bucket {ti}/{len(targets)}] unique so far: {len(seen_pids):,}  saved: {total_saved:,}")
         if limit and len(seen_pids) >= limit:
             break
 
